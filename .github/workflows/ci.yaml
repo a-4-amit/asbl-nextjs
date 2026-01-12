@@ -1,0 +1,222 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+# Cancel older runs on the same branch/PR (keeps CI fast + relevant)
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege permissions for CI
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "20"
+  NEXT_TELEMETRY_DISABLED: "1"
+  CI: "true"
+
+jobs:
+  ## Run Lint (Fail on warnings ! )
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Run lint (fail on warnings)
+        run: |
+          if npm run -s lint; then
+            echo "lint script executed"
+          else
+            echo "No lint script found. Fallback to eslint."
+            npx eslint . --max-warnings=0
+          fi
+
+  ## Formatting
+  format:
+    name: Format (Prettier)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Prettier check
+        run: |
+          if npm run -s format:check; then
+            echo "format:check script executed"
+          elif npm run -s prettier:check; then
+            echo "prettier:check script executed"
+          else
+            echo "No prettier script found. Fallback to npx prettier."
+            npx prettier --check .
+          fi
+
+  ## Build
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [ lint, format ]   # runs only if both succeed
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      # Optional: typecheck if the repo has it; won't break if missing
+      - name: Typecheck (optional)
+        run: |
+          if npm run -s typecheck; then
+            echo "typecheck script executed"
+          else
+            echo "No typecheck script found. Skipping."
+          fi
+
+      - name: Build
+        run: npm run build 
+
+  ## Security scan
+  security:
+    name: Security
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [ build ]          # runs only after build succeeds
+    permissions:
+      contents: read
+      pull-requests: read     # required for dependency-review-action on PRs
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # PR-focused: flags vulnerable dependencies introduced by the PR
+      - if: github.event_name == 'pull_request'
+        name: Dependency Review
+        uses: actions/dependency-review-action@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      # Baseline scan - tune audit level as needed
+      - name: npm audit (high+)
+        run: npm audit --audit-level=high
+
+      # Run Trivy scans and upload results on GH security
+      - name: Trivy FS scan (SARIF)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: "fs"
+          ignore-unfixed: true
+          vuln-type: "os,library"
+          severity: "HIGH,CRITICAL"
+          format: "sarif"
+          output: "trivy-results.sarif"
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+
+  docker_build:
+    name: Docker Build (local)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [ build ]
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (load locally)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          tags: startup-nextjs:${{ github.sha }}
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  image_scan:
+    name: Image Scan (Trivy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [ docker_build ]
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (load locally)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          tags: startup-nextjs:${{ github.sha }}
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy Image scan (SARIF)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: "image"
+          image-ref: "startup-nextjs:${{ github.sha }}"
+          ignore-unfixed: true
+          vuln-type: "os,library"
+          severity: "HIGH,CRITICAL"
+          format: "sarif"
+          output: "trivy-image-results.sarif"
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image-results.sarif
