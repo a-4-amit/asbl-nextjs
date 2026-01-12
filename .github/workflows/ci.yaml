@@ -41,9 +41,26 @@ jobs:
 
       - name: Run lint (fail on warnings)
         run: |
-          node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.lint ? 0 : 1)" \
-            && npm run lint \
-            || (echo "No lint script found. Fallback to 'next lint'." && npx --yes next lint)
+          set -euo pipefail
+          echo "Running lint…"
+
+          if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.lint ? 0 : 1)"; then
+            # run lint and capture output (so we can detect the Next.js lint bug)
+            set +e
+            npm run lint 2>&1 | tee lint.log
+            status=${PIPESTATUS[0]}
+            set -e
+
+            if [ "$status" -ne 0 ] && grep -q "Invalid project directory provided" lint.log; then
+              echo "Detected Next.js 'next lint' project-dir issue. Falling back to ESLint v8 using .eslintrc.*"
+              npx --yes eslint@8.57.0 . --max-warnings=0
+            else
+              exit "$status"
+            fi
+          else
+            echo "No lint script found. Running ESLint v8 using .eslintrc.*"
+            npx --yes eslint@8.57.0 . --max-warnings=0
+          fi
 
   ## Formatting
   format:
@@ -63,37 +80,38 @@ jobs:
       - name: Install deps
         run: npm ci
 
-      - name: Prettier check
+      ## Find Afected files
+      - name: Determine files to format-check
+        id: changes
         run: |
-      - name: Prettier check
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base_ref="${{ github.event.pull_request.base.sha }}"
+            head_ref="${{ github.event.pull_request.head.sha }}"
+          else
+            base_ref="${{ github.sha }}^"
+            head_ref="${{ github.sha }}"
+          fi
+
+          files=$(git diff --name-only "$base_ref" "$head_ref" \
+            | tr '\n' ' ' \
+            | sed 's/  */ /g' \
+            | sed 's/^ *//;s/ *$//')
+
+          echo "files=$files" >> "$GITHUB_OUTPUT"
+      ## check affected files
+      - name: Prettier check (changed files only)
+        if: steps.changes.outputs.files != ''
         run: |
-          node - <<'NODE'
-          const fs = require('fs');
-          const p = require('./package.json');
-          const s = p.scripts || {};
-          const hasScript = Boolean(s['format:check'] || s['prettier:check'] || s['format']);
-          const hasConfig = [
-            '.prettierrc',
-            '.prettierrc.json',
-            '.prettierrc.yml',
-            '.prettierrc.yaml',
-            '.prettierrc.js',
-            '.prettierrc.cjs',
-            'prettier.config.js',
-            'prettier.config.cjs',
-            'prettier.config.mjs'
-          ].some(f => fs.existsSync(f)) || Boolean(p.prettier);
+          set -euo pipefail
+          npx --yes prettier@3.3.3 --check ${{ steps.changes.outputs.files }}
 
-          if (!hasScript && !hasConfig) {
-            console.log('No Prettier script/config found. Skipping format check.');
-            process.exit(0);
-          }
-          console.log('Prettier script/config detected. Enforcing format check.');
-          process.exit(0);
-          NODE
+      ## When no file affected
+      - name: Prettier check (no changes)
+        if: steps.changes.outputs.files == ''
+        run: echo "No changed files to format-check. Skipping."
 
-          (npm run -s format:check || npm run -s prettier:check || npm run -s format || npx --yes prettier --check .)
-
+        
   ## Build
   build:
     name: Build
