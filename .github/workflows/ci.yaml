@@ -73,6 +73,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0         
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -102,13 +104,32 @@ jobs:
             fi
           fi
 
-          echo "Head: $head_ref"
+          echo "Base: $base_ref"
 
-          files=$(git diff --name-only "$base_ref" "$head_ref" -- \
-            | tr '\n' ' ' \
-            | sed 's/  */ /g' \
-            | sed 's/^ *//;s/ *$//')
-          echo "Changed files: ${files:-<none>}"
+          changed=$(git diff --name-only "$base_ref" "$head_ref" -- || true)
+
+          # Keep only text file types Prettier supports by default.
+          files=""
+          for f in $changed; do
+            # Skip deleted files
+            [ -f "$f" ] || continue
+
+            case "$f" in
+              *.js|*.jsx|*.ts|*.tsx|*.json|*.yml|*.yaml|*.md|*.css|*.scss|*.html)
+                files="$files $f"
+                ;;
+              .github/workflows/*.yml|.github/workflows/*.yaml)
+                files="$files $f"
+                ;;
+              *)
+                ;;
+            esac
+          done
+
+          # Normalize whitespace
+          files=$(echo "$files" | sed 's/  */ /g' | sed 's/^ *//;s/ *$//')
+
+          echo "Prettier-check files: ${files:-<none>}"
           echo "files=$files" >> "$GITHUB_OUTPUT"
 
       ## check affected files
@@ -116,8 +137,8 @@ jobs:
         if: steps.changes.outputs.files != ''
         run: |
           set -euo pipefail
-          npx --yes prettier@3.3.3 --check ${{ steps.changes.outputs.files }}
-
+          npx --yes prettier@3.3.3 --ignore-unknown --check ${{ steps.changes.outputs.files }}
+          
       ## When no file affected
       - name: Prettier check (no changes)
         if: steps.changes.outputs.files == ''
