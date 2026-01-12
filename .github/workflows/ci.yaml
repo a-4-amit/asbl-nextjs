@@ -29,6 +29,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -42,6 +44,7 @@ jobs:
       - name: Run lint (fail on warnings)
         run: |
           set -euo pipefail
+
           echo "Running lint…"
 
           if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.lint ? 0 : 1)"; then
@@ -89,16 +92,25 @@ jobs:
             base_ref="${{ github.event.pull_request.base.sha }}"
             head_ref="${{ github.event.pull_request.head.sha }}"
           else
-            base_ref="${{ github.sha }}^"
+            # On push events, prefer the 'before' SHA from the webhook payload.
+            base_ref="${{ github.event.before }}"
             head_ref="${{ github.sha }}"
+
+            # If this is the first commit (all zeros) or base doesn't exist locally, diff against empty tree.
+            if [ -z "$base_ref" ] || [ "$base_ref" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$base_ref^{commit}" 2>/dev/null; then
+              base_ref=$(git hash-object -t tree /dev/null)
+            fi
           fi
 
-          files=$(git diff --name-only "$base_ref" "$head_ref" \
+          echo "Head: $head_ref"
+
+          files=$(git diff --name-only "$base_ref" "$head_ref" -- \
             | tr '\n' ' ' \
             | sed 's/  */ /g' \
             | sed 's/^ *//;s/ *$//')
-
+          echo "Changed files: ${files:-<none>}"
           echo "files=$files" >> "$GITHUB_OUTPUT"
+
       ## check affected files
       - name: Prettier check (changed files only)
         if: steps.changes.outputs.files != ''
